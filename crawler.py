@@ -125,3 +125,22 @@ if not markets:
 
 if __name__ == "__main__":
     main()
+
+
+def upsert_market_info(client, items):
+    rows = []
+    for it in items:
+        wcd = str(it.get("whsl_mrkt_cd", "")).strip()
+        ccd = str(it.get("corp_cd", "")).strip()
+        if not wcd or not ccd:
+            continue
+        rows.append({
+            "whsl_mrkt_cd": wcd,
+            "corp_cd": ccd,
+            "whsl_mrkt_nm": it.get("whsl_mrkt_nm"),
+            "corp_nm": it.get("corp_nm"),
+        })
+
+    if rows:
+        client.table("markets").upsert(rows, on_conflict="whsl_mrkt_cd,corp_cd").execute()
+        print("UPSERT markets:", len(rows))
