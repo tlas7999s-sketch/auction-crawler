@@ -1,95 +1,136 @@
 import os
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import date
+from supabase import create_client
 
 BASE_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
 
-def fetch_data(date_str: str):
-    service_key = os.getenv("SERVICE_KEY", "").strip()
+def supa():
+    url = os.environ["SUPABASE_URL"]
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    return create_client(url, key)
 
-    # 1) 서비스키 유무 체크
+def fetch_data(date_str: str, whsl_mrkt_cd: str, corp_cd: str):
+    service_key = os.getenv("SERVICE_KEY", "").strip()
     if not service_key:
-        raise RuntimeError("SERVICE_KEY가 비어있음. GitHub Secrets에 SERVICE_KEY가 제대로 등록됐는지 확인!")
+        raise RuntimeError("SERVICE_KEY 비어있음")
 
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
         "numOfRows": 50,
         "returnType": "json",
-
-        # 예시 조건(현재는 부산/대저로 보이는 코드값들)
-        "cond[whsl_mrkt_cd::EQ]": "110001",
-        "cond[corp_cd::EQ]": "11000103",
-        "cond[gds_lclsf_cd::EQ]": "08",
-        "cond[gds_mclsf_cd::EQ]": "03",
+        "cond[whsl_mrkt_cd::EQ]": whsl_mrkt_cd,
+        "cond[corp_cd::EQ]": corp_cd,
+        "cond[gds_lclsf_cd::EQ]": "08",  # 과일과채류 (예시)
+        "cond[gds_mclsf_cd::EQ]": "03",  # 토마토 (예시)
         "cond[trd_clcln_ymd::EQ]": date_str,
     }
 
     res = requests.get(BASE_URL, params=params, timeout=30)
-
-    # ★ 디버깅 핵심: 실제 호출 URL 확인
-    print("REQUEST URL:", res.url)
-
-    # ★ 디버깅: 상태/타입/응답 앞부분
     print("HTTP:", res.status_code)
     print("Content-Type:", res.headers.get("Content-Type"))
-    print("Body(head 300):", res.text[:300])
+    print("Body(head 200):", res.text[:200])
+    res.raise_for_status()
+    return res.json()
 
-    # 2) JSON 파싱 시도 (실패하면 보통 XML/HTML 에러)
+def to_float(x):
     try:
-        data = res.json()
-    except Exception as e:
-        raise RuntimeError(
-            f"JSON 파싱 실패: {e}\n"
-            f"응답 앞부분(300): {res.text[:300]}"
-        )
+        return float(x)
+    except:
+        return None
 
-    # 3) 응답 구조 요약 출력 (API마다 구조가 다를 수 있어서)
-    print("TOP KEYS:", list(data.keys())[:20])
+def save_raw(items, meta):
+    client = supa()
 
-    # 보통 공공데이터포털은 response/header/body 형태가 많음
-    resp = data.get("response")
-    if isinstance(resp, dict):
-        header = resp.get("header", {})
-        body = resp.get("body", {})
-        print("HEADER:", header)
+    rows = []
+    for it in items:
+        rows.append({
+            "trd_clcln_ymd": meta["date"],
+            "whsl_mrkt_cd": it.get("whsl_mrkt_cd"),
+            "whsl_mrkt_nm": it.get("whsl_mrkt_nm"),
+            "corp_cd": it.get("corp_cd"),
+            "corp_nm": it.get("corp_nm"),
+            "gds_lclsf_cd": it.get("gds_lclsf_cd"),
+            "gds_lclsf_nm": it.get("gds_lclsf_nm"),
+            "gds_mclsf_cd": it.get("gds_mclsf_cd"),
+            "gds_mclsf_nm": it.get("gds_mclsf_nm"),
+            "gds_sclsf_cd": it.get("gds_sclsf_cd"),
+            "gds_sclsf_nm": it.get("gds_sclsf_nm"),
+            "gds_sclsfc_nm": it.get("gds_sclsfc_nm"),
+            "gds_id": it.get("gds_id"),
+            "gds_nm": it.get("gds_nm"),
+            "unit_nm": it.get("unit_nm"),
+            "unit_qty": to_float(it.get("unit_qty")),
+            "qty": to_float(it.get("qty")),
+            "amt": to_float(it.get("amt")),
+            "kg_amt": to_float(it.get("kg_amt")),
+            "payload": it,
+        })
 
-        # item이 어디에 들어오는지 확인
-        items = None
-        if isinstance(body, dict):
-            items = body.get("items")
-            # items가 dict면 또 item 키가 있을 수 있음
-            if isinstance(items, dict) and "item" in items:
-                items = items["item"]
+    if rows:
+        client.table("auction_trades_raw").insert(rows).execute()
+        print("RAW inserted:", len(rows))
+    else:
+        print("No items -> skip insert")
 
-        if items is None:
-            print("ITEMS: (없음) / body keys:", list(body.keys())[:20] if isinstance(body, dict) else type(body))
-        else:
-            # items가 list인지 dict인지 출력
-            if isinstance(items, list):
-                print("ITEMS COUNT:", len(items))
-                if len(items) > 0:
-                    print("FIRST ITEM:", items[0])
-            else:
-                print("ITEMS TYPE:", type(items))
-                print("ITEMS SAMPLE:", items)
+def save_daily_agg(items, date_str):
+    # 그래프용: 시장/단위별 평균(kg_amt) 집계 저장
+    # (여기선 “토마토 + 2.5kg”만 예시로 집계)
+    client = supa()
 
-    return data
+    bucket = {}
+    for it in items:
+        unit_qty = to_float(it.get("unit_qty"))
+        gname = it.get("gds_mclsf_nm")
+        if gname != "토마토":
+            continue
+        if unit_qty != 2.5:
+            continue
 
+        key = (it.get("whsl_mrkt_cd"), it.get("whsl_mrkt_nm"), gname, unit_qty)
+        kg_amt = to_float(it.get("kg_amt"))
+        if kg_amt is None:
+            continue
+
+        bucket.setdefault(key, []).append(kg_amt)
+
+    upserts = []
+    for (mcd, mnm, gname, unit_qty), vals in bucket.items():
+        upserts.append({
+            "trd_clcln_ymd": date_str,
+            "whsl_mrkt_cd": mcd,
+            "whsl_mrkt_nm": mnm,
+            "gds_mclsf_nm": gname,
+            "unit_qty": unit_qty,
+            "avg_kg_amt": sum(vals)/len(vals),
+            "min_kg_amt": min(vals),
+            "max_kg_amt": max(vals),
+            "count_items": len(vals),
+        })
+
+    if upserts:
+        client.table("auction_daily_agg").upsert(upserts, on_conflict="trd_clcln_ymd,whsl_mrkt_cd,gds_mclsf_nm,unit_qty").execute()
+        print("AGG upserted:", len(upserts))
+    else:
+        print("No agg rows")
 
 def main():
-    # 한국 날짜 기준 "오늘" (UTC+9)
-    kst = timezone(timedelta(hours=9))
-    today = datetime.now(kst).strftime("%Y-%m-%d")
+    today = date.today().isoformat()
 
-    print("===== START =====")
-    print("DATE:", today)
+    # ✅ 일단 “성공했던 값” 1개로 테스트
+    whsl_mrkt_cd = "110001"
+    corp_cd = "11000103"
 
-    data = fetch_data(today)
+    data = fetch_data(today, whsl_mrkt_cd, corp_cd)
+    body = data.get("response", {}).get("body", {})
+    items = body.get("items", {}).get("item", [])
+    if isinstance(items, dict):
+        items = [items]
 
-    print("===== DONE =====")
-    # 필요하면 여기서 파일로 저장하거나 DB 저장 단계로 확장
-
+    print("ITEMS COUNT:", len(items))
+    save_raw(items, {"date": today})
+    save_daily_agg(items, today)
 
 if __name__ == "__main__":
     main()
