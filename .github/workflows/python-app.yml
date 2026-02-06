@@ -21,8 +21,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run crawler
-        env:
-          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
-        run: |
-          python crawler.py
+- name: Run crawler
+  env:
+    SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  run: |
+    python crawler.py
+
