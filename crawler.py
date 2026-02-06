@@ -87,6 +87,8 @@ if not markets:
             num_rows=50,
         )
 
+        upsert_market_info(client, items)
+        
         print("ITEMS:", len(items))
         if not items:
             continue
