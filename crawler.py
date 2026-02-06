@@ -1,196 +1,121 @@
 import os
-import time
+import json
 import requests
-from datetime import date
+from datetime import datetime, date
 from supabase import create_client
 
 BASE_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
+TABLE = "raw_trades_ingest"
 
-# ✅ 여기만 늘리면 "모든 시장" 확장 가능
-# (whsl_mrkt_cd, corp_cd)
-MARKETS = [
-    ("110001", "11000103"),  # 너가 성공한 조합 (예시)
-    # ("부산시장코드", "법인코드"),
-]
-
-def get_env(name: str) -> str:
+def must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
         raise RuntimeError(f"{name} 가 비어있음. GitHub Secrets에 {name} 등록 확인!")
     return v
 
-def get_supabase():
-    url = get_env("SUPABASE_URL")
-    key = get_env("SUPABASE_SERVICE_ROLE_KEY")
-    return create_client(url, key)
-
-def fetch_data(date_str: str, whsl_mrkt_cd: str, corp_cd: str) -> dict:
-    service_key = get_env("SERVICE_KEY")
-
+def fetch_items(service_key: str, date_str: str, whsl_mrkt_cd: str, corp_cd: str,
+                gds_lclsf_cd: str="08", gds_mclsf_cd: str="03", num_rows: int=50):
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
-        "numOfRows": 50,
+        "numOfRows": num_rows,
         "returnType": "json",
-
-        # ✅ 시장/법인
         "cond[whsl_mrkt_cd::EQ]": whsl_mrkt_cd,
         "cond[corp_cd::EQ]": corp_cd,
-
-        # ✅ 품목 대분류/중분류 (너가 쓰던 값 유지)
-        "cond[gds_lclsf_cd::EQ]": "08",
-        "cond[gds_mclsf_cd::EQ]": "03",
-
-        # ✅ 정산일자
+        "cond[gds_lclsf_cd::EQ]": gds_lclsf_cd,
+        "cond[gds_mclsf_cd::EQ]": gds_mclsf_cd,
         "cond[trd_clcln_ymd::EQ]": date_str,
     }
 
     res = requests.get(BASE_URL, params=params, timeout=30)
-
-    # Actions 로그 확인용
-    print("REQUEST URL:", res.url.replace(service_key, "***"))
     print("HTTP:", res.status_code)
     print("Content-Type:", res.headers.get("Content-Type"))
     print("Body(head 200):", res.text[:200])
 
     res.raise_for_status()
-    return res.json()
+    data = res.json()
 
-def to_float(x):
-    try:
-        return float(x)
-    except:
-        return None
-
-def normalize_items(data: dict) -> list[dict]:
-    body = (data.get("response") or {}).get("body") or {}
-    items = (body.get("items") or {}).get("item") or []
-
-    # item이 1개면 dict로 내려오는 경우 방지
+    items = (
+        data.get("response", {})
+            .get("body", {})
+            .get("items", {})
+            .get("item", [])
+    )
     if isinstance(items, dict):
         items = [items]
-    if not isinstance(items, list):
-        items = []
     return items
 
-def save_raw(items: list[dict], date_str: str):
-    client = get_supabase()
-
-    rows = []
-    for it in items:
-        rows.append({
-            "trd_clcln_ymd": date_str,
-            "whsl_mrkt_cd": it.get("whsl_mrkt_cd"),
-            "whsl_mrkt_nm": it.get("whsl_mrkt_nm"),
-            "corp_cd": it.get("corp_cd"),
-            "corp_nm": it.get("corp_nm"),
-            "gds_lclsf_cd": it.get("gds_lclsf_cd"),
-            "gds_lclsf_nm": it.get("gds_lclsf_nm"),
-            "gds_mclsf_cd": it.get("gds_mclsf_cd"),
-            "gds_mclsf_nm": it.get("gds_mclsf_nm"),
-            "gds_sclsf_cd": it.get("gds_sclsf_cd"),
-            "gds_sclsf_nm": it.get("gds_sclsf_nm"),
-            "gds_sclsfc_nm": it.get("gds_sclsfc_nm"),
-            "gds_id": it.get("gds_id"),
-            "gds_nm": it.get("gds_nm"),
-            "unit_nm": it.get("unit_nm"),
-            "unit_qty": to_float(it.get("unit_qty")),
-            "qty": to_float(it.get("qty")),
-            "amt": to_float(it.get("amt")),
-            "kg_amt": to_float(it.get("kg_amt")),
-            "payload": it,  # 원본 전체 저장
-        })
-
-    if not rows:
-        print("RAW: no rows -> skip")
-        return
-
-    client.table("auction_trades_raw").insert(rows).execute()
-    print("RAW inserted:", len(rows))
-
-def save_daily_agg(items: list[dict], date_str: str):
-    """
-    그래프용 집계(옵션):
-    - 토마토
-    - unit_qty = 2.5
-    - kg_amt 평균/최소/최대/건수
-    """
-    client = get_supabase()
-
-    bucket = {}  # key -> list[kg_amt]
-    meta = {}    # key -> (market_nm)
-
-    for it in items:
-        gname = it.get("gds_mclsf_nm")  # 예: "토마토"
-        unit_qty = to_float(it.get("unit_qty"))
-        kg_amt = to_float(it.get("kg_amt"))
-
-        if gname != "토마토":
-            continue
-        if unit_qty != 2.5:
-            continue
-        if kg_amt is None:
-            continue
-
-        mcd = it.get("whsl_mrkt_cd")
-        mnm = it.get("whsl_mrkt_nm")
-        key = (mcd, gname, unit_qty)
-
-        bucket.setdefault(key, []).append(kg_amt)
-        meta[key] = mnm
-
-    upserts = []
-    for (mcd, gname, unit_qty), vals in bucket.items():
-        upserts.append({
-            "trd_clcln_ymd": date_str,
-            "whsl_mrkt_cd": mcd,
-            "whsl_mrkt_nm": meta.get((mcd, gname, unit_qty)),
-            "gds_mclsf_nm": gname,
-            "unit_qty": unit_qty,
-            "avg_kg_amt": sum(vals) / len(vals),
-            "min_kg_amt": min(vals),
-            "max_kg_amt": max(vals),
-            "count_items": len(vals),
-        })
-
-    if not upserts:
-        print("AGG: no rows -> skip")
-        return
-
-    client.table("auction_daily_agg").upsert(
-        upserts,
-        on_conflict="trd_clcln_ymd,whsl_mrkt_cd,gds_mclsf_nm,unit_qty"
-    ).execute()
-    print("AGG upserted:", len(upserts))
-
 def main():
-    today = date.today().isoformat()
     print("===== START =====")
-    print("DATE:", today)
 
-    total_items = 0
+    service_key = must_env("SERVICE_KEY")
+    supabase_url = must_env("SUPABASE_URL")
+    supabase_key = must_env("SUPABASE_SERVICE_ROLE_KEY")
 
-    for whsl_mrkt_cd, corp_cd in MARKETS:
+    # 기본값: 오늘(한국 기준)
+    today = date.today().isoformat()
+    date_str = os.getenv("TARGET_DATE", today).strip() or today
+    print("DATE:", date_str)
+
+    # 일단 네가 성공했던 값(예시)로 시작
+    markets = [
+        {"whsl_mrkt_cd": "110001", "corp_cd": "11000103"},  # 예시
+    ]
+
+    client = create_client(supabase_url, supabase_key)
+
+    total_inserted = 0
+
+    for m in markets:
+        whsl_mrkt_cd = m["whsl_mrkt_cd"]
+        corp_cd = m["corp_cd"]
         print(f"\n--- MARKET {whsl_mrkt_cd} / CORP {corp_cd} ---")
 
-        data = fetch_data(today, whsl_mrkt_cd, corp_cd)
-        items = normalize_items(data)
+        items = fetch_items(
+            service_key=service_key,
+            date_str=date_str,
+            whsl_mrkt_cd=whsl_mrkt_cd,
+            corp_cd=corp_cd,
+            gds_lclsf_cd="08",
+            gds_mclsf_cd="03",
+            num_rows=50,
+        )
 
-        print("ITEMS COUNT:", len(items))
-        if items:
-            print("FIRST ITEM:", items[0])
+        print("ITEMS:", len(items))
+        if not items:
+            continue
 
-        # ✅ Supabase 저장
-        save_raw(items, today)
-        save_daily_agg(items, today)
+        rows = []
+        for it in items:
+            rows.append({
+                "trd_clcln_ymd": date_str,
+                "whsl_mrkt_cd": whsl_mrkt_cd,
+                "corp_cd": corp_cd,
+                "gds_lclsf_cd": "08",
+                "gds_mclsf_cd": "03",
+                "payload": it,  # 원본 통째 저장
+            })
 
-        total_items += len(items)
+        resp = client.table(TABLE).insert(rows).execute()
 
-        # ✅ 무료/차단 방지: 시장 늘리면 약간 쉬기
-        time.sleep(0.5)
+        # supabase-py는 성공/실패를 resp에 담아줌 (실패 시 여기가 힌트)
+        data = getattr(resp, "data", None)
+        err = getattr(resp, "error", None)
 
-    print("\nTOTAL ITEMS:", total_items)
+        print("INSERT data len:", 0 if data is None else len(data))
+        print("INSERT error:", err)
+
+        if err:
+            raise RuntimeError(f"Supabase insert 실패: {err}")
+
+        total_inserted += (0 if data is None else len(data))
+
+    print("\nTOTAL INSERTED:", total_inserted)
     print("===== DONE =====")
+
+    # 0이면 실패로 처리해서 Actions에서 바로 눈에 띄게
+    if total_inserted == 0:
+        raise RuntimeError("INSERT가 0건임 (조건/테이블/키 확인 필요)")
 
 if __name__ == "__main__":
     main()
