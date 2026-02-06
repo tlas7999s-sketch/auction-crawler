@@ -58,9 +58,15 @@ def main():
     print("DATE:", date_str)
 
     # 일단 네가 성공했던 값(예시)로 시작
-    markets = [
-        {"whsl_mrkt_cd": "110001", "corp_cd": "11000103"},  # 예시
-    ]
+def load_markets(client):
+    rows = client.table("markets").select("whsl_mrkt_cd, corp_cd").execute().data
+    return [{"whsl_mrkt_cd": r["whsl_mrkt_cd"], "corp_cd": r["corp_cd"]} for r in rows]
+
+markets = load_markets(client)
+
+if not markets:
+    raise RuntimeError("markets 테이블이 비어있음. 먼저 markets를 채워야 함!")
+
 
     client = create_client(supabase_url, supabase_key)
 
