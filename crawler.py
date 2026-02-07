@@ -3,6 +3,8 @@ import json
 import requests
 from datetime import datetime, date
 from supabase import create_client
+from markets import MARKETS
+
 
 BASE_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
 TABLE = "raw_trades_ingest"
