@@ -1,13 +1,11 @@
 import os
-from datetime import date
-
 import requests
+from datetime import date
 from supabase import create_client
 
-from markets import MARKETS
-
 BASE_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
-TABLE = "raw_trades_ingest"
+INGEST_TABLE = "raw_trades_ingest"   # 네 Supabase 테이블명
+MARKETS_TABLE = "markets"            # 네 Supabase markets 테이블명
 
 
 def must_env(name: str) -> str:
@@ -17,15 +15,8 @@ def must_env(name: str) -> str:
     return v
 
 
-def fetch_items(
-    service_key: str,
-    date_str: str,
-    whsl_mrkt_cd: str,
-    corp_cd: str,
-    gds_lclsf_cd: str = "08",
-    gds_mclsf_cd: str = "03",
-    num_rows: int = 50,
-):
+def fetch_items(service_key: str, date_str: str, whsl_mrkt_cd: str, corp_cd: str,
+                gds_lclsf_cd: str = "08", gds_mclsf_cd: str = "03", num_rows: int = 50):
     params = {
         "serviceKey": service_key,
         "pageNo": 1,
@@ -39,7 +30,8 @@ def fetch_items(
     }
 
     res = requests.get(BASE_URL, params=params, timeout=30)
-    print("REQUEST URL:", res.url)
+
+    print("REQUEST URL:", res.url.replace(service_key, "***"))
     print("HTTP:", res.status_code)
     print("Content-Type:", res.headers.get("Content-Type"))
     print("Body(head 200):", res.text[:200])
@@ -53,67 +45,35 @@ def fetch_items(
             .get("items", {})
             .get("item", [])
     )
-
     if isinstance(items, dict):
         items = [items]
-    if items is None:
-        items = []
-
     return items
 
 
-def load_markets_from_db(client):
-    """
-    Supabase markets 테이블에서 (whsl_mrkt_cd, corp_cd) 목록을 읽어온다.
-    테이블이 없거나 권한/스키마 문제면 예외가 날 수 있으니 try/except로 감싼다.
-    """
-    try:
-        resp = client.table("markets").select("whsl_mrkt_cd, corp_cd").execute()
-        rows = resp.data or []
-        markets = []
-        for r in rows:
-            w = str(r.get("whsl_mrkt_cd", "")).strip()
-            c = str(r.get("corp_cd", "")).strip()
-            if w and c:
-                markets.append({"whsl_mrkt_cd": w, "corp_cd": c})
-        return markets
-    except Exception as e:
-        print("WARN: markets 테이블 로드 실패(없을 수 있음). fallback to markets.py")
-        print("DETAIL:", e)
-        return []
+def load_markets(client):
+    # markets 테이블에서 (whsl_mrkt_cd, corp_cd) 가져오기
+    resp = client.table(MARKETS_TABLE).select("whsl_mrkt_cd,corp_cd").execute()
+    rows = resp.data or []
+    return [{"whsl_mrkt_cd": str(r["whsl_mrkt_cd"]), "corp_cd": str(r["corp_cd"])} for r in rows]
 
 
 def upsert_market_info(client, items):
-    """
-    응답 item 안에 whsl_mrkt_nm / corp_nm이 있으면 markets 테이블에 upsert로 업데이트한다.
-    중복 제거해서 upsert.
-    """
-    uniq = {}
+    rows = []
     for it in items:
         wcd = str(it.get("whsl_mrkt_cd", "")).strip()
         ccd = str(it.get("corp_cd", "")).strip()
         if not wcd or not ccd:
             continue
-
-        key = (wcd, ccd)
-        uniq[key] = {
+        rows.append({
             "whsl_mrkt_cd": wcd,
             "corp_cd": ccd,
             "whsl_mrkt_nm": it.get("whsl_mrkt_nm"),
             "corp_nm": it.get("corp_nm"),
-        }
+        })
 
-    rows = list(uniq.values())
-    if not rows:
-        return
-
-    try:
-        client.table("markets").upsert(rows, on_conflict="whsl_mrkt_cd,corp_cd").execute()
+    if rows:
+        client.table(MARKETS_TABLE).upsert(rows, on_conflict="whsl_mrkt_cd,corp_cd").execute()
         print("UPSERT markets:", len(rows))
-    except Exception as e:
-        # markets 테이블이 없거나 RLS 때문에 실패할 수 있으니, 수집 자체는 계속 진행
-        print("WARN: markets upsert 실패(수집은 계속).")
-        print("DETAIL:", e)
 
 
 def main():
@@ -130,16 +90,9 @@ def main():
     date_str = os.getenv("TARGET_DATE", today).strip() or today
     print("DATE:", date_str)
 
-    # 1) DB에 markets 테이블이 있으면 그걸 우선 사용
-    markets = load_markets_from_db(client)
-
-    # 2) DB가 비어있거나 실패하면 markets.py의 MARKETS를 사용
+    markets = load_markets(client)
     if not markets:
-        print("INFO: DB markets 비어있음 -> markets.py MARKETS 사용")
-        markets = [{"whsl_mrkt_cd": w, "corp_cd": c} for (w, c) in MARKETS]
-
-    if not markets:
-        raise RuntimeError("시장 목록이 비어있음. markets 테이블 또는 markets.py를 채워야 함!")
+        raise RuntimeError("markets 테이블이 비어있음. 먼저 markets를 채워야 함!")
 
     total_inserted = 0
 
@@ -160,7 +113,7 @@ def main():
 
         print("ITEMS:", len(items))
 
-        # markets 테이블 업데이트 시도(실패해도 수집은 계속)
+        # markets 이름 업데이트(옵션)
         upsert_market_info(client, items)
 
         if not items:
@@ -174,24 +127,27 @@ def main():
                 "corp_cd": corp_cd,
                 "gds_lclsf_cd": "08",
                 "gds_mclsf_cd": "03",
-                "payload": it,  # 원본 JSON 저장
+                "payload": it,  # 원본 통째 저장(JSON)
             })
 
-        resp = client.table(TABLE).insert(rows).execute()
+        resp = client.table(INGEST_TABLE).insert(rows).execute()
         data = getattr(resp, "data", None)
+        err = getattr(resp, "error", None)
 
-        inserted = 0 if data is None else len(data)
-        print("INSERTED:", inserted)
+        print("INSERT data len:", 0 if data is None else len(data))
+        print("INSERT error:", err)
 
-        total_inserted += inserted
+        if err:
+            raise RuntimeError(f"Supabase insert 실패: {err}")
+
+        total_inserted += (0 if data is None else len(data))
 
     print("\nTOTAL INSERTED:", total_inserted)
-print("===== DONE =====")
+    print("===== DONE =====")
 
-# 0건이어도 정상 종료 (데이터 없는 날이 많을 수 있음)
-if total_inserted == 0:
-    print("No data for today (0 rows). Exit 0.")
+    # 0건이어도 정상 종료(데이터 없는 날도 있어서)
     return
+
 
 if __name__ == "__main__":
     main()
