@@ -5,7 +5,7 @@ from datetime import date
 from supabase import create_client
 
 BASE_URL = "https://apis.data.go.kr/B552845/katRealTime2/trades2"
-TABLE = "raw_trades_ingest"
+RAW_TABLE = "raw_trades_ingest"
 
 # 토마토(과일과채류/토마토)
 GDS_LCLSF_CD = "08"
@@ -18,12 +18,7 @@ def must_env(name: str) -> str:
     return v
 
 def fetch_page(service_key: str, date_str: str, page_no: int, num_rows: int):
-    """
-    ✅ 전국 수집 포인트:
-    whsl_mrkt_cd, corp_cd 조건을 '안 넣고' 요청하면
-    해당 날짜/품목 기준으로 전국 데이터가 내려오는 경우가 많음.
-    (API 정책상 제한/트래픽에 따라 일부만 내려오면 페이지로 계속 받음)
-    """
+    # ✅ 전국 수집: whsl_mrkt_cd/corp_cd 조건을 넣지 않음
     params = {
         "serviceKey": service_key,
         "pageNo": page_no,
@@ -43,13 +38,12 @@ def fetch_page(service_key: str, date_str: str, page_no: int, num_rows: int):
     items = (body.get("items", {}) or {}).get("item", []) or []
     if isinstance(items, dict):
         items = [items]
-
     total_count = body.get("totalCount")
-    return items, total_count, data
+    return items, total_count
 
 def upsert_markets(client, items):
     """
-    응답 payload에 들어있는 시장/법인/이름을 markets 테이블에 자동 반영
+    ✅ 핵심: raw 응답에서 발견된 시장/법인 코드+이름을 markets 테이블에 누적 저장
     """
     rows = []
     seen = set()
@@ -88,19 +82,17 @@ def insert_raw(client, date_str: str, items):
             "payload": it,
         })
 
-    resp = client.table(TABLE).insert(rows).execute()
+    resp = client.table(RAW_TABLE).insert(rows).execute()
     err = getattr(resp, "error", None)
     if err:
         raise RuntimeError(f"Supabase insert 실패: {err}")
-
     data = getattr(resp, "data", None)
     inserted = 0 if data is None else len(data)
-    print("INSERT:", inserted)
+    print("INSERT raw:", inserted)
     return inserted
 
 def main():
     print("===== START =====")
-
     service_key = must_env("SERVICE_KEY")
     supabase_url = must_env("SUPABASE_URL")
     supabase_key = must_env("SUPABASE_SERVICE_ROLE_KEY")
@@ -110,40 +102,28 @@ def main():
     date_str = os.getenv("TARGET_DATE", today).strip() or today
     print("DATE:", date_str)
 
-    # ✅ 500개 제한 깨는 핵심: 페이지네이션
     page_no = 1
-    num_rows = int(os.getenv("NUM_ROWS", "1000"))  # 크게 받되, 안되면 200/500으로 낮추면 됨
+    num_rows = int(os.getenv("NUM_ROWS", "1000"))  # 200/500/1000 중에서 안정적인 값 사용
     total_inserted = 0
 
     while True:
-        items, total_count, _raw = fetch_page(service_key, date_str, page_no, num_rows)
+        items, total_count = fetch_page(service_key, date_str, page_no, num_rows)
         print("ITEMS:", len(items), "totalCount:", total_count)
 
         if not items:
             break
 
-        # markets 자동 업데이트 (시장/법인 전체가 점점 채워짐)
         upsert_markets(client, items)
-
-        # raw 저장
         total_inserted += insert_raw(client, date_str, items)
 
         page_no += 1
-
-        # 트래픽/서버 보호용 약간 대기
         time.sleep(0.2)
 
-        # totalCount가 숫자로 오면(=API가 전체 건수 알려주면) 더 안정적으로 종료 가능
-        if isinstance(total_count, int):
-            if (page_no - 1) * num_rows >= total_count:
-                break
+        if isinstance(total_count, int) and (page_no - 1) * num_rows >= total_count:
+            break
 
     print("\nTOTAL INSERTED:", total_inserted)
     print("===== DONE =====")
-
-    # “데이터가 없어서 0건”은 정상일 수도 있으니, 액션 실패로 처리하고 싶으면 아래 주석 해제
-    # if total_inserted == 0:
-    #     raise RuntimeError("INSERT가 0건임 (해당 날짜에 데이터가 없을 수 있음)")
 
 if __name__ == "__main__":
     main()
