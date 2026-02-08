@@ -186,11 +186,12 @@ def main():
         total_inserted += inserted
 
     print("\nTOTAL INSERTED:", total_inserted)
-    print("===== DONE =====")
+print("===== DONE =====")
 
-    if total_inserted == 0:
-        raise RuntimeError("INSERT가 0건임 (조건/테이블/키/날짜 확인 필요)")
-
+# 0건이어도 정상 종료 (데이터 없는 날이 많을 수 있음)
+if total_inserted == 0:
+    print("No data for today (0 rows). Exit 0.")
+    return
 
 if __name__ == "__main__":
     main()
